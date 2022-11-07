@@ -191,6 +191,16 @@ bool InitializeTweakDBMetadata(TiltedPhoques::Map<uint64_t, TDBIDLookupEntry>& l
 void LuaVM::HookLog(RED4ext::IScriptable*, RED4ext::CStackFrame* apStack, void*, void*)
 {
     static RTTILocator s_stringLocator("String");
+    static RED4ext::CName s_logFuncName("Log");
+    static RED4ext::CName s_logWarningFuncName("LogWarning");
+    static RED4ext::CName s_logErrorFuncName("LogError");
+    static RED4ext::CName s_ftLogFuncName("FTLog");
+    static RED4ext::CName s_ftLogWarningFuncName("FTLogWarning");
+    static RED4ext::CName s_ftLogErrorFuncName("FTLogError");
+    static RED4ext::CName s_ensureFailureFuncName("EnsureFailure");
+    static RED4ext::CName s_reportFailureFuncName("ReportFailure");
+
+    const auto funcName = apStack->func->shortName;
 
     RED4ext::CString text{};
 
@@ -208,14 +218,32 @@ void LuaVM::HookLog(RED4ext::IScriptable*, RED4ext::CStackFrame* apStack, void*,
     RED4ext::OpcodeHandlers::Run(opcode, apStack->context, apStack, &ref, &ref);
     apStack->code++; // skip ParamEnd
 
-    spdlog::get("gamelog")->info("{}", ref.ref->c_str());
+    if (funcName == s_logFuncName)
+        spdlog::get("gamelog")->info("[General] {}", ref.ref->c_str());
+    else if (funcName == s_logWarningFuncName)
+        spdlog::get("gamelog")->warn("[WARNING: General] {}", ref.ref->c_str());
+    else if (funcName == s_logErrorFuncName)
+        spdlog::get("gamelog")->error("[ERROR: General] {}", ref.ref->c_str());
+    else if (funcName == s_ftLogFuncName)
+        spdlog::get("gamelog")->info("[FunctionalTests] {}", ref.ref->c_str());
+    else if (funcName == s_ftLogWarningFuncName)
+        spdlog::get("gamelog")->warn("[WARNING: FunctionalTests] {}", ref.ref->c_str());
+    else if (funcName == s_ftLogErrorFuncName)
+        spdlog::get("gamelog")->error("[ERROR: FunctionalTests] {}", ref.ref->c_str());
+    else if (funcName == s_ensureFailureFuncName || funcName == s_reportFailureFuncName)
+        spdlog::get("gamelog")->error("[FAILURE] {}", ref.ref->c_str());
 }
 
 void LuaVM::HookLogChannel(RED4ext::IScriptable*, RED4ext::CStackFrame* apStack, void*, void*)
 {
     static RTTILocator s_stringLocator("String");
+    static RED4ext::CName s_logChannelFuncName("LogChannel");
+    static RED4ext::CName s_logChannelWarningFuncName("LogChannelWarning");
+    static RED4ext::CName s_logChannelErrorFuncName("LogChannelError");
     static RED4ext::CName s_debugChannel("DEBUG");
     static RED4ext::CName s_assertionChannel("ASSERT");
+
+    const auto funcName = apStack->func->shortName;
 
     RED4ext::CName channel;
     apStack->data = nullptr;
@@ -242,18 +270,21 @@ void LuaVM::HookLogChannel(RED4ext::IScriptable*, RED4ext::CStackFrame* apStack,
 
     if (channel == s_debugChannel)
         spdlog::get("scripting")->info("{}", ref.ref->c_str());
-
-    std::string_view channelSV = channel.ToString();
-    if (channelSV.empty())
-        spdlog::get("gamelog")->info("[?{:X}] {}", channel.hash, ref.ref->c_str());
+    else if (channel == s_assertionChannel)
+        spdlog::get("gamelog")->error("[ASSERT] {}", ref.ref->c_str());
     else
     {
-        if (channel == s_debugChannel)
-            spdlog::get("gamelog")->debug("[{}] {}", channelSV, ref.ref->c_str());
-        else if (channel == s_assertionChannel)
-            spdlog::get("gamelog")->error("[{}] {}", channelSV, ref.ref->c_str());
-        else
+        std::string_view channelSV = channel.ToString();
+        const auto channelHashStr = std::format("?{:X}", channel.hash);
+        if (channelSV.empty())
+            channelSV = channelHashStr;
+
+        if (funcName == s_logChannelFuncName)
             spdlog::get("gamelog")->info("[{}] {}", channelSV, ref.ref->c_str());
+        else if (funcName == s_logChannelWarningFuncName)
+            spdlog::get("gamelog")->warn("[WARNING: {}] {}", channelSV, ref.ref->c_str());
+        else if (funcName == s_logChannelErrorFuncName)
+            spdlog::get("gamelog")->error("[ERROR: {}] {}", channelSV, ref.ref->c_str());
     }
 }
 

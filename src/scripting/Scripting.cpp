@@ -628,9 +628,43 @@ void Scripting::RegisterOverrides()
         registerInputListener(aSelf, aSelf);
     };
 
+    // DEBUG channel is used by mods, is not an existing channel in game
+
+    luaVm["LogChannel"] = [](RED4ext::CString aChannel, RED4ext::CName aMessage)
+    {
+        if (strcmp(aChannel.c_str(), "DEBUG") == 0)
+            spdlog::get("scripting")->info("{}", aMessage.ToString());
+        else if (strcmp(aChannel.c_str(), "ASSERT") == 0)
+            spdlog::get("gamelog")->error("[ASSERT] {}", aMessage.ToString());
+        else
+            spdlog::get("gamelog")->info("[{}] {}", aChannel.c_str(), aMessage.ToString());
+    };
+
+    luaVm["LogChannelWarning"] = [](RED4ext::CString aChannel, RED4ext::CName aMessage)
+    {
+        assert(strcmp(aChannel.c_str(), "ASSERT") != 0);
+        if (strcmp(aChannel.c_str(), "DEBUG") == 0)
+            spdlog::get("scripting")->warn("{}", aMessage.ToString());
+        else
+            spdlog::get("gamelog")->warn("[WARNING: {}] {}", aChannel.c_str(), aMessage.ToString());
+    };
+
+    luaVm["LogChannelError"] = [](RED4ext::CString aChannel, RED4ext::CName aMessage)
+    {
+        assert(strcmp(aChannel.c_str(), "ASSERT") != 0);
+        if (strcmp(aChannel.c_str(), "DEBUG") == 0)
+            spdlog::get("scripting")->error("{}", aMessage.ToString());
+        else
+            spdlog::get("gamelog")->error("[ERROR: {}] {}", aChannel.c_str(), aMessage.ToString());
+    };
+
     m_override.Override("PlayerPuppet", "GracePeriodAfterSpawn", luaVm["RegisterGlobalInputListener"], sol::nil, false, false, true);
     m_override.Override("PlayerPuppet", "OnDetach", sol::nil, sol::nil, false, false, true);
     m_override.Override("QuestTrackerGameController", "OnUninitialize", sol::nil, sol::nil, false, false, true);
+
+    m_override.Override("", "LogChannel", luaVm["LogChannel"], sol::nil, false, false, true);
+    m_override.Override("LogChannelWarning", "LogChannelWarning", luaVm["LogChannelWarning"], sol::nil, false, false, true);
+    m_override.Override("Game", "LogChannelError", luaVm["LogChannelError"], sol::nil, false, false, true);
 }
 
 const VKBind* Scripting::GetBind(const VKModBind& acModBind) const
