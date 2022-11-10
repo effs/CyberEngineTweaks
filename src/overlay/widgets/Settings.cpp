@@ -80,6 +80,10 @@ void Settings::OnUpdate()
                 UpdateAndDrawSetting("Disable Boundary Teleport", "Allows players to access out-of-bounds locations (requires restart to take effect).", m_patchDisableBoundaryTeleport, m_options.PatchDisableBoundaryTeleport);
                 UpdateAndDrawSetting("Disable V-Sync (Windows 7 only)", " (requires restart to take effect).", m_patchDisableWin7Vsync, m_options.PatchDisableWin7Vsync);
                 UpdateAndDrawSetting("Fix Minimap Flicker", "Disables VSync on Windows 7 to bypass the 60 FPS limit (requires restart to take effect).", m_patchMinimapFlicker, m_options.PatchMinimapFlicker);
+                UpdateAndDrawSetting("Enable Font Anti-aliasing", "Enables anti-aliasing of Cyber Engine Tweaks fonts.", m_enableFontAntialiasing, m_options.FontOversampleHorizontal != 1 || m_options.FontOversampleVertical != 1);
+
+                if (m_enableFontAntialiasing != (m_options.FontOversampleHorizontal != 1 || m_options.FontOversampleVertical != 1))
+                    CET::Get().GetD3D12().ReloadFonts();
 
                 ImGui::EndTable();
             }
@@ -130,6 +134,10 @@ void Settings::Load()
     m_patchDisableWin7Vsync = m_options.PatchDisableWin7Vsync;
     m_patchMinimapFlicker = m_options.PatchMinimapFlicker;
 
+    if (m_enableFontAntialiasing != (m_options.FontOversampleHorizontal != 1 || m_options.FontOversampleVertical != 1))
+        CET::Get().GetD3D12().ReloadFonts();
+    m_enableFontAntialiasing = m_options.FontOversampleHorizontal != 1 || m_options.FontOversampleVertical != 1;
+
     m_removeDeadBindings = m_options.RemoveDeadBindings;
     m_enableImGuiAssertionsLogging = m_options.EnableImGuiAssertionsLogging;
     m_patchEnableDebug = m_options.PatchEnableDebug;
@@ -148,6 +156,17 @@ void Settings::Save() const
     m_options.PatchDisableBoundaryTeleport = m_patchDisableBoundaryTeleport;
     m_options.PatchDisableWin7Vsync = m_patchDisableWin7Vsync;
     m_options.PatchMinimapFlicker = m_patchMinimapFlicker;
+
+    if (m_enableFontAntialiasing != (m_options.FontOversampleHorizontal != 1 || m_options.FontOversampleVertical != 1))
+    {
+        m_options.FontOversampleHorizontal = 1;
+        m_options.FontOversampleVertical = 1;
+    }
+    else
+    {
+        m_options.FontOversampleHorizontal = 3;
+        //m_options.FontOversampleVertical = 1;
+    }
 
     m_options.RemoveDeadBindings = m_removeDeadBindings;
     m_options.EnableImGuiAssertionsLogging = m_enableImGuiAssertionsLogging;
