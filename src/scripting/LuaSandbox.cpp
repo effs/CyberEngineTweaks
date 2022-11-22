@@ -150,15 +150,16 @@ static constexpr const char* s_cGlobalExtraLibsWhitelist[] =
     "ImGui",
 };
 
-LuaSandbox::LuaSandbox(Scripting* apScripting, const VKBindings& acVKBindings)
-    : m_pScripting(apScripting)
+LuaSandbox::LuaSandbox(const Options& acOptions, Scripting& aScripting, const VKBindings& acVKBindings)
+    : m_options(acOptions)
+    , m_scripting(aScripting)
     , m_vkBindings(acVKBindings)
 {
 }
 
 void LuaSandbox::Initialize()
 {
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     auto& luaState = lockedState.Get();
     auto globals = luaState.globals();
 
@@ -187,12 +188,12 @@ void LuaSandbox::Initialize()
         m_globals["os"] = osCopy;
     }
 
-    CreateSandbox("", "", false, false, false, false);
+    CreateSandbox("", "", false, false, false, true);
 }
 
 void LuaSandbox::PostInitializeScripting()
 {
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     auto& luaState = lockedState.Get();
     auto globals = luaState.globals();
 
@@ -203,7 +204,7 @@ void LuaSandbox::PostInitializeScripting()
 
 void LuaSandbox::PostInitializeTweakDB()
 {
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     auto& luaState = lockedState.Get();
     auto globals = luaState.globals();
 
@@ -214,7 +215,7 @@ void LuaSandbox::PostInitializeTweakDB()
 
 void LuaSandbox::PostInitializeMods()
 {
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     auto& luaState = lockedState.Get();
     auto globals = luaState.globals();
 
@@ -228,7 +229,7 @@ void LuaSandbox::ResetState()
     if (m_modules.empty())
         return;
 
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     auto& luaState = lockedState.Get();
 
     for (size_t i = 1; i < m_sandboxes.size(); ++i)
@@ -246,10 +247,10 @@ uint64_t LuaSandbox::CreateSandbox(const std::filesystem::path& acPath, const st
     const uint64_t cResID = m_sandboxes.size();
     assert(!cResID || (!acPath.empty() && !acName.empty()));
 
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     const auto& luaState = lockedState.Get();
 
-    auto& res = m_sandboxes.emplace_back(cResID, m_pScripting, m_globals, acPath);
+    auto& res = m_sandboxes.emplace_back(m_scripting, cResID, m_globals, acPath);
     if (!acPath.empty() && !acName.empty())
     {
         if (aEnableExtraLibs)
@@ -258,9 +259,9 @@ uint64_t LuaSandbox::CreateSandbox(const std::filesystem::path& acPath, const st
             InitializeDBForSandbox(res, luaState);
         if (aEnableIO)
             InitializeIOForSandbox(res, luaState, acName);
-        if (aEnableLogger)
-            InitializeLoggerForSandbox(res, luaState, acName);
     }
+    if (aEnableLogger)
+        InitializeLoggerForSandbox(res, luaState, acName);
     return cResID;
 }
 
@@ -278,18 +279,18 @@ const Sandbox& LuaSandbox::operator[](uint64_t aID) const
 
 TiltedPhoques::Locked<sol::state, std::recursive_mutex> LuaSandbox::GetLockedState() const
 {
-    return m_pScripting->GetLockedState();
+    return m_scripting.GetLockedState();
 }
 
 void LuaSandbox::SetImGuiAvailable(bool aAvailable)
 {
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     m_imguiAvailable = aAvailable;
 }
 
 bool LuaSandbox::GetImGuiAvailable() const
 {
-    auto lockedState = m_pScripting->GetLockedState();
+    auto lockedState = m_scripting.GetLockedState();
     return m_imguiAvailable;
 }
 
@@ -653,20 +654,58 @@ void LuaSandbox::InitializeLoggerForSandbox(Sandbox& aSandbox, const sol::state&
     const auto& cSBRootPath = aSandbox.GetRootPath();
 
     // initialize logger for this mod
-    auto logger = CreateLogger(GetAbsolutePath(acName + ".log", cSBRootPath, true), acName);
-
-    // assign logger to mod so it can be used from within it too
-    sol::table spdlog(acpState, sol::create);
-    spdlog["trace"]    = [logger](const std::string& message) { logger->trace("{}", message);    };
-    spdlog["debug"]    = [logger](const std::string& message) { logger->debug("{}", message);    };
-    spdlog["info"]     = [logger](const std::string& message) { logger->info("{}", message);     };
-    spdlog["warning"]  = [logger](const std::string& message) { logger->warn("{}", message);     };
-    spdlog["error"]    = [logger](const std::string& message) { logger->error("{}", message);    };
-    spdlog["critical"] = [logger](const std::string& message) { logger->critical("{}", message); };
-    sbEnv["spdlog"] = spdlog;
+    auto logger = acName.empty() ? spdlog::get("scripting") : CreateLogger(GetAbsolutePath(acName + ".log", cSBRootPath, true), acName);
 
     // assign logger to special var so we can access it from our functions
     sbEnv["__logger"] = logger;
+
+    // assign logger to mod so it can be used from within it too
+    sol::table modLog(acpState, sol::create);
+
+    auto logMessage = [logger](spdlog::level::level_enum aLogLevel, sol::variadic_args aArgs, sol::this_state aState)
+    {
+        std::ostringstream oss;
+        sol::state_view s(aState);
+        for (auto it = aArgs.cbegin(); it != aArgs.cend(); ++it)
+        {
+            if (it != aArgs.cbegin())
+                oss << " ";
+            std::string str = s["tostring"]((*it).get<sol::object>());
+            oss << str;
+        }
+
+        logger->log(aLogLevel, "{}", oss.str().c_str());
+    };
+
+    modLog["trace"]    = [logMessage](sol::variadic_args aArgs, sol::this_state aState) { logMessage(spdlog::level::level_enum::trace,    aArgs, aState); };
+    modLog["debug"]    = [logMessage](sol::variadic_args aArgs, sol::this_state aState) { logMessage(spdlog::level::level_enum::debug,    aArgs, aState); };
+    modLog["info"]     = [logMessage](sol::variadic_args aArgs, sol::this_state aState) { logMessage(spdlog::level::level_enum::info,     aArgs, aState); };
+    modLog["warning"]  = [logMessage](sol::variadic_args aArgs, sol::this_state aState) { logMessage(spdlog::level::level_enum::warn,     aArgs, aState); };
+    modLog["error"]    = [logMessage](sol::variadic_args aArgs, sol::this_state aState) { logMessage(spdlog::level::level_enum::err,      aArgs, aState); };
+    modLog["critical"] = [logMessage](sol::variadic_args aArgs, sol::this_state aState) { logMessage(spdlog::level::level_enum::critical, aArgs, aState); };
+
+    if (acName.empty())
+    {
+        // in case of empty name, bind modLog to consoleLog
+        sbEnv["consoleLog"] = modLog;
+        return;
+    }
+
+    sbEnv["modLog"] = modLog;
+    sbEnv["consoleLog"] = m_sandboxes[0].GetEnvironment()["consoleLog"];
+
+    // keep old spdlog binding for compatibility
+    sbEnv["spdlog"] = sbEnv["modLog"];
+
+    // TODO - make this use real mod name when we have mod info
+    auto logWindow = std::make_shared<LogWindow>(m_options, acName + " Log", acName);
+    sbEnv["__loggerWindow"] = logWindow;
+    sbEnv["ToggleModLogDraw"] = [logWindow]{
+        logWindow->Toggle();
+    };
+    sbEnv["IsModLogDrawEnabled"] = [logWindow]{
+        return logWindow->IsEnabled();
+    };
 }
 
 void LuaSandbox::CloseDBForSandbox(const Sandbox& aSandbox) const

@@ -30,16 +30,16 @@ static constexpr bool s_cThrowLuaErrors = true;
 
 static RTTILocator s_stringType{RED4ext::FNV1a64("String")};
 
-Scripting::Scripting(const Paths& aPaths, VKBindings& aBindings, D3D12& aD3D12)
-    : m_sandbox(this, aBindings)
+Scripting::Scripting(const Paths& acPaths, const Options& acOptions, VKBindings& aBindings, D3D12& aD3D12)
+    : m_sandbox(acOptions, *this, aBindings)
     , m_mapper(m_lua.AsRef(), m_sandbox)
-    , m_store(m_sandbox, aPaths, aBindings)
+    , m_store(m_sandbox, acPaths, aBindings)
     , m_override(this)
-    , m_paths(aPaths)
+    , m_paths(acPaths)
     , m_d3d12(aD3D12)
 {
-    CreateLogger(aPaths.CETRoot() / "scripting.log", "scripting");
-    CreateLogger(aPaths.CETRoot() / "gamelog.log", "gamelog");
+    CreateLogger(acPaths.CETRoot() / "scripting.log", "scripting");
+    CreateLogger(acPaths.CETRoot() / "gamelog.log", "gamelog");
 }
 
 void Scripting::Initialize()
@@ -89,28 +89,11 @@ void Scripting::Initialize()
         });
     }
 
-    // setup logger for console sandbox
+
+    // load in basic game bindings
     auto& consoleSB = m_sandbox[0];
     auto& consoleSBEnv = consoleSB.GetEnvironment();
-    consoleSBEnv["__logger"] = spdlog::get("scripting");
-
-    // load in game bindings
-    globals["print"] = [](sol::variadic_args aArgs, sol::this_state aState)
-    {
-        std::ostringstream oss;
-        sol::state_view s(aState);
-        for (auto it = aArgs.cbegin(); it != aArgs.cend(); ++it)
-        {
-            if (it != aArgs.cbegin())
-            {
-                oss << " ";
-            }
-            std::string str = s["tostring"]((*it).get<sol::object>());
-            oss << str;
-        }
-
-        spdlog::get("scripting")->info(oss.str());
-    };
+    globals["print"] = consoleSBEnv["consoleLog"]["info"]; // alias for backwards compat
 
     globals["GetVersion"] = []() -> std::string
     {
@@ -668,7 +651,7 @@ void Scripting::TriggerOnUpdate(float aDeltaTime) const
     m_store.TriggerOnUpdate(aDeltaTime);
 }
 
-void Scripting::TriggerOnDraw() const
+void Scripting::TriggerOnDraw()
 {
     m_store.TriggerOnDraw();
 }

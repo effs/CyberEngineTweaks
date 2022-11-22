@@ -22,7 +22,7 @@ struct TDBIDLookupEntry
 struct Image;
 struct LuaVM
 {
-    LuaVM(const Paths& aPaths, VKBindings& aBindings, D3D12& aD3D12);
+    LuaVM(const Paths& acPaths, const Options& acOptions, VKBindings& aBindings, D3D12& aD3D12);
     ~LuaVM() = default;
 
     [[nodiscard]] const VKBind* GetBind(const VKModBind& acModBind) const;
@@ -32,7 +32,7 @@ struct LuaVM
     bool ExecuteLua(const std::string& acCommand) const;
 
     void Update(float aDeltaTime);
-    void Draw() const;
+    void Draw();
     void ReloadAllMods();
 
     void OnOverlayOpen() const;

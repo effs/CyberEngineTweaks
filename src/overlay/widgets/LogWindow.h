@@ -1,10 +1,17 @@
 #pragma once
 
-struct LogWindow
-{
-    LogWindow(const std::string& acpLoggerName);
+#include "Widget.h"
 
-    void Draw(const ImVec2& size);
+struct LogWindow : Widget
+{
+    LogWindow(const Options& acOptions, const std::string& acpWindowTitle, const std::string& acpLoggerName);
+
+protected:
+    void OnUpdate() override;
+
+    void DrawLog(const ImVec2& size);
+
+    const Options& m_options;
 
 private:
     void Log(const std::string& acpText);
