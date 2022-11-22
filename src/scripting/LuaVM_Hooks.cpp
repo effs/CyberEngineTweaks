@@ -261,6 +261,8 @@ LuaVM::LuaVM(const Paths& aPaths, VKBindings& aBindings, D3D12& aD3D12)
     : m_scripting(aPaths, aBindings, aD3D12)
     , m_d3d12(aD3D12)
 {
+    s_vm = this;
+
     Hook();
 
     // launch initialization of TweakDBID lookup and resource list on separate thread to not hog the game
@@ -277,6 +279,24 @@ LuaVM::LuaVM(const Paths& aPaths, VKBindings& aBindings, D3D12& aD3D12)
 
         ResourcesList::Get()->Initialize();
     }).detach();
+
+    GameMainThread::Get().AddRunningTask([this]{
+        const auto cNow = std::chrono::high_resolution_clock::now();
+        const auto cDelta = cNow - m_lastframe;
+        const auto cSeconds = std::chrono::duration_cast<std::chrono::duration<float>>(cDelta);
+
+        Update(cSeconds.count());
+
+        m_lastframe = cNow;
+
+        return false;
+    });
+
+    GameMainThread::Get().AddShutdownTask([this]{
+        m_scripting.UnloadAllMods();
+
+        return true;
+    });
 
     aBindings.SetVM(this);
 }
@@ -306,56 +326,44 @@ void LuaVM::HookTDBIDToStringDEBUG(RED4ext::IScriptable*, RED4ext::CStackFrame* 
     }
 }
 
-uintptr_t LuaVM::HookSetLoadingState(uintptr_t aThis, int aState)
-{
-    static std::once_flag s_initBarrier;
-
-    if (aState == 2)
-    {
-        std::call_once(s_initBarrier, []
-        {
-            s_vm->PostInitializeMods();
-        });
-    }
-
-    return s_vm->m_realSetLoadingState(aThis, aState);
-}
-
 bool LuaVM::HookTranslateBytecode(uintptr_t aBinder, uintptr_t aData)
 {
     const auto ret = s_vm->m_realTranslateBytecode(aBinder, aData);
 
     if (ret)
-    {
         s_vm->PostInitializeScripting();
-    }
 
     return ret;
 }
 
-uint64_t LuaVM::HookPlayerSpawned(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+void LuaVM::HookPlayerSpawned(RED4ext::IScriptable* a1, RED4ext::CStackFrame* a2, void* a3, void* a4)
 {
-    const auto ret = s_vm->m_realPlayerSpawned(a1, a2, a3, a4);
-
-    if (!s_vm->m_initialized)
+    // call PostInitializeMods following main thread tick
+    // as this function is called from worker thread
+    GameMainThread::Get().AddGenericTask([]{
         s_vm->PostInitializeMods();
 
-    return ret;
+        return true;
+    });
+
+    s_vm->m_realPlayerSpawned(a1, a2, a3, a4);
 }
 
 uint64_t LuaVM::HookTweakDBLoad(uintptr_t aThis, uintptr_t aParam)
 {
-    const auto ret = s_vm->m_realTweakDBLoad(aThis, aParam);
+    // call PostInitializeTweakDB following main thread tick
+    // as this function is called from worker thread
+    GameMainThread::Get().AddGenericTask([]{
+        s_vm->PostInitializeTweakDB();
 
-    s_vm->PostInitializeTweakDB();
+        return true;
+    });
 
-    return ret;
+    return s_vm->m_realTweakDBLoad(aThis, aParam);
 }
 
 void LuaVM::Hook()
 {
-    s_vm = this;
-
     {
         const RED4ext::RelocPtr<uint8_t> func(CyberEngineTweaks::Addresses::CScript_Log);
         uint8_t* pLocation = func.GetAddr();
@@ -461,23 +469,4 @@ void LuaVM::Hook()
             }
         }
     }
-
-    GameMainThread::Get().AddRunningTask([this]{
-        const auto cNow = std::chrono::high_resolution_clock::now();
-        const auto cDelta = cNow - s_vm->m_lastframe;
-        const auto cSeconds = std::chrono::duration_cast<std::chrono::duration<float>>(cDelta);
-
-        s_vm->Update(cSeconds.count());
-
-        s_vm->m_lastframe = cNow;
-
-        return false;
-    });
-
-    GameMainThread::Get().AddShutdownTask([this]{
-        s_vm->m_scripting.UnloadAllMods();
-
-        return true;
-    });
-
 }

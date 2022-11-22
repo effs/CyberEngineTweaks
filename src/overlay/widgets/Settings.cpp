@@ -58,7 +58,7 @@ void Settings::OnUpdate()
         m_madeChanges = false;
         if (ImGui::CollapsingHeader("Patches", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::TreePush();
+            ImGui::TreePush(static_cast<void*>(nullptr));
             if (ImGui::BeginTable("##SETTINGS_PATCHES", 2, ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingStretchSame, ImVec2(-ImGui::GetStyle().IndentSpacing, 0)))
             {
                 const auto& patchesSettings = m_options.Patches;
@@ -79,7 +79,7 @@ void Settings::OnUpdate()
         }
         if (ImGui::CollapsingHeader("CET Development Settings", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::TreePush();
+            ImGui::TreePush(static_cast<void*>(nullptr));
             if (ImGui::BeginTable("##SETTINGS_DEV", 2, ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingStretchSame, ImVec2(-ImGui::GetStyle().IndentSpacing, 0)))
             {
                 const auto& developerSettings = m_options.Developer;
@@ -110,7 +110,18 @@ void Settings::OnUpdate()
 
 void Settings::Load()
 {
+    const auto previousFontSettings = m_options.Font;
+
     m_options.Load();
+
+    if (previousFontSettings != m_options.Font)
+    {
+        GameMainThread::Get().AddGenericTask([]{
+            CET::Get().GetD3D12().ReloadFonts();
+
+            return true;
+        });
+    }
 
     m_patches = m_options.Patches;
     m_developer = m_options.Developer;

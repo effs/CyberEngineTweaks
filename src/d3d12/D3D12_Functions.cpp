@@ -1,300 +1,174 @@
 #include <stdafx.h>
 
 #include "D3D12.h"
-#include "Options.h"
-#include "Utils.h"
 
 #include <CET.h>
-#include <imgui_impl/dx12.h>
-#include <imgui_impl/win32.h>
+#include <imgui/imgui_impl_dx12.h>
+#include <imgui/imgui_impl_win32.h>
+#include <Utils.h>
 #include <window/window.h>
 
-bool D3D12::ResetState(const bool acClearDownlevelBackbuffers, const bool acDestroyContext)
+void D3D12::Shutdown()
 {
-    if (m_initialized)
-    {
-        std::lock_guard _(m_imguiLock);
+    std::lock_guard statePresentLock(m_statePresentMutex);
+    std::lock_guard stateGameLock(m_stateGameMutex);
+    std::lock_guard imguiLock(m_imguiMutex);
 
+    m_shutdown = true;
+
+    m_window.Hook(nullptr);
+
+    if (ImGui::GetCurrentContext())
+    {
         for (auto& drawData : m_imguiDrawDataBuffers)
         {
             for (auto i = 0; i < drawData.CmdListsCount; ++i)
                 IM_DELETE(drawData.CmdLists[i]);
             delete[] drawData.CmdLists;
-            drawData.CmdLists = nullptr;
             drawData.Clear();
         }
 
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();
 
-        if (acDestroyContext)
-            ImGui::DestroyContext();
+        ImGui::DestroyContext();
     }
 
-    m_frameContexts.clear();
-    m_outSize = { 0, 0 };
+    for (auto& frameContext : m_frameContexts)
+    {
+        frameContext.CommandAllocator.Reset();
+        frameContext.CommandList.Reset();
+    }
 
-    if (acClearDownlevelBackbuffers)
-        m_downlevelBackbuffers.clear();
-    m_downlevelBufferIndex = 0;
-
-    m_pd3d12Device.Reset();
-    m_pd3dRtvDescHeap.Reset();
     m_pd3dSrvDescHeap.Reset();
-    m_pd3dCommandList.Reset();
 
-    m_pCommandQueue.Reset();
-    m_pdxgiSwapChain.Reset();
+    m_swapChainDataId = 0;
+    m_resolution = ImVec2();
 
     m_initialized = false;
-
-    return false;
 }
 
-bool D3D12::Initialize()
+void D3D12::Initialize(uint32_t aSwapChainDataId)
 {
-    if (m_initialized)
-        return true;
+    std::lock_guard statePresentLock(m_statePresentMutex);
+    std::lock_guard stateGameLock(m_stateGameMutex);
+    std::lock_guard imguiLock(m_imguiMutex);
 
-    if (!m_pdxgiSwapChain)
-        return false;
+    assert(!m_initialized && !m_shutdown);
+    if (m_initialized || m_shutdown)
+        return;
 
-    const HWND hWnd = m_window.GetWindow();
-    if (!hWnd)
+    // we need valid swap chain data ID (this must be set even on Win7)
+    if (aSwapChainDataId == 0)
+        return;
+
+    // we need valid render context
+    const auto* cpRenderContext = RenderContext::GetInstance();
+    if (cpRenderContext == nullptr)
+        return;
+
+    // we need to have valid device
+    const auto cpDevice = cpRenderContext->pDevice;
+    if (cpDevice == nullptr)
+        return;
+
+    // if any back buffer is nullptr, don't continue initialization
+    auto swapChainData = cpRenderContext->pSwapChainData[aSwapChainDataId - 1];
+    for (auto& pBackBuffer : swapChainData.backBuffers)
     {
-        Log::Warn("D3D12::InitializeDownlevel() - window not yet hooked!");
-        return false;
+        if (pBackBuffer == nullptr)
+            return;
     }
 
-    if (FAILED(m_pdxgiSwapChain->GetDevice(IID_PPV_ARGS(&m_pd3d12Device))))
-    {
-        Log::Error("D3D12::Initialize() - failed to get device!");
-        return ResetState();
-    }
+    // we need valid window
+    const auto cpWindow = swapChainData.pWindow;
+    if (cpWindow == nullptr)
+        return;
 
-    DXGI_SWAP_CHAIN_DESC sdesc;
-    m_pdxgiSwapChain->GetDesc(&sdesc);
+    m_swapChainDataId = aSwapChainDataId;
 
-    if (hWnd != sdesc.OutputWindow)
-        Log::Warn("D3D12::Initialize() - output window of current swap chain does not match hooked window! Currently hooked to {} while swap chain output window is {}.", reinterpret_cast<void*>(hWnd), reinterpret_cast<void*>(sdesc.OutputWindow));
-
-    m_outSize = { static_cast<LONG>(sdesc.BufferDesc.Width), static_cast<LONG>(sdesc.BufferDesc.Height) };
-
-    const auto buffersCounts = std::min(sdesc.BufferCount, 3u);
-    m_frameContexts.resize(buffersCounts);
+    const auto cBackBufferDesc = swapChainData.backBuffers[0]->GetDesc();
+    m_resolution = ImVec2(static_cast<float>(cBackBufferDesc.Width), static_cast<float>(cBackBufferDesc.Height));
 
     D3D12_DESCRIPTOR_HEAP_DESC srvdesc = {};
     srvdesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvdesc.NumDescriptors = buffersCounts;
+    srvdesc.NumDescriptors = SwapChainData_BackBufferCount;
     srvdesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(m_pd3d12Device->CreateDescriptorHeap(&srvdesc, IID_PPV_ARGS(&m_pd3dSrvDescHeap))))
+    if (FAILED(cpDevice->CreateDescriptorHeap(&srvdesc, IID_PPV_ARGS(&m_pd3dSrvDescHeap))))
     {
         Log::Error("D3D12::Initialize() - failed to create SRV descriptor heap!");
-        return ResetState();
+        return Shutdown();
     }
 
-    D3D12_DESCRIPTOR_HEAP_DESC rtvdesc;
-    rtvdesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtvdesc.NumDescriptors = buffersCounts;
-    rtvdesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    rtvdesc.NodeMask = 1;
-    if (FAILED(m_pd3d12Device->CreateDescriptorHeap(&rtvdesc, IID_PPV_ARGS(&m_pd3dRtvDescHeap))))
+    for (auto& frameContext : m_frameContexts)
     {
-        Log::Error("D3D12::Initialize() - failed to create RTV descriptor heap!");
-        return ResetState();
-    }
-
-    const SIZE_T rtvDescriptorSize = m_pd3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_pd3dRtvDescHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT i = 0; i < buffersCounts; i++)
-    {
-        auto& context = m_frameContexts[i];
-        context.MainRenderTargetDescriptor = rtvHandle;
-        m_pdxgiSwapChain->GetBuffer(i, IID_PPV_ARGS(&context.BackBuffer));
-        m_pd3d12Device->CreateRenderTargetView(context.BackBuffer.Get(), nullptr, context.MainRenderTargetDescriptor);
-        rtvHandle.ptr += rtvDescriptorSize;
-    }
-
-    for (auto& context : m_frameContexts)
-        if (FAILED(m_pd3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&context.CommandAllocator))))
+        if (FAILED(cpDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frameContext.CommandAllocator))))
         {
             Log::Error("D3D12::Initialize() - failed to create command allocator!");
-            return ResetState();
+            return Shutdown();
         }
 
-    if (FAILED(m_pd3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_frameContexts[0].CommandAllocator.Get(), nullptr, IID_PPV_ARGS(&m_pd3dCommandList))) ||
-        FAILED(m_pd3dCommandList->Close()))
-    {
-        Log::Error("D3D12::Initialize() - failed to create command list!");
-        return ResetState();
+        if (FAILED(cpDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frameContext.CommandAllocator.Get(), nullptr, IID_PPV_ARGS(&frameContext.CommandList))) ||
+            FAILED(frameContext.CommandList->Close()))
+        {
+            Log::Error("D3D12::Initialize() - failed to create command list!");
+            return Shutdown();
+        }
     }
 
-    if (!InitializeImGui(buffersCounts))
+    m_window.Hook(cpWindow);
+
+    if (!InitializeImGui())
     {
         Log::Error("D3D12::Initialize() - failed to initialize ImGui!");
-        return ResetState();
+        return Shutdown();
     }
 
     Log::Info("D3D12::Initialize() - initialization successful!");
     m_initialized = true;
-
-    OnInitialized.Emit();
-
-    return true;
 }
 
-bool D3D12::InitializeDownlevel(ID3D12CommandQueue* apCommandQueue, ID3D12Resource* apSourceTex2D, HWND ahWindow)
+void D3D12::ReloadFonts(bool aForce)
 {
-    if (!apCommandQueue || !apSourceTex2D)
-        return false;
+    std::lock_guard statePresentLock(m_statePresentMutex);
+    std::lock_guard stateGameLock(m_stateGameMutex);
+    std::lock_guard imguiLock(m_imguiMutex);
 
-    const HWND hWnd = m_window.GetWindow();
-    if (!hWnd)
-    {
-        Log::Warn("D3D12::InitializeDownlevel() - window not yet hooked!");
-        return false;
-    }
+    const auto& cFontSettings = m_options.Font;
 
-    if (m_initialized)
-    {
-        if (hWnd != ahWindow)
-            Log::Warn("D3D12::InitializeDownlevel() - current output window does not match hooked window! Currently hooked to {} while current output window is {}.", reinterpret_cast<void*>(hWnd), reinterpret_cast<void*>(ahWindow));
+    if (!aForce && cFontSettings == m_fontSettings)
+        return;
 
-        return true;
-    }
+    const auto cDPIScale = ImGui_ImplWin32_GetDpiScaleForHwnd(m_window.GetWindow());
+    const auto cResolution = GetResolution();
+    const auto cResolutionScaleFromReference = std::min(cResolution.x / 1920.0f, cResolution.y / 1080.0f);
 
-    const auto cmdQueueDesc = apCommandQueue->GetDesc();
-    if(cmdQueueDesc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
-    {
-        Log::Warn("D3D12::InitializeDownlevel() - ignoring command queue - invalid type of command list!");
-        return false;
-    }
+    const auto cFontSize = std::floorf(cFontSettings.BaseSize * cDPIScale * cResolutionScaleFromReference);
+    const auto cFontScaleFromReference = cFontSize / 18.0f;
 
-    m_pCommandQueue = apCommandQueue;
+    ImGui::GetStyle() = m_imguiStyleReference;
+    ImGui::GetStyle().ScaleAllSizes(cFontScaleFromReference);
 
-    const auto st2DDesc = apSourceTex2D->GetDesc();
-    m_outSize = { static_cast<LONG>(st2DDesc.Width), static_cast<LONG>(st2DDesc.Height) };
-
-    if (hWnd != ahWindow)
-        Log::Warn("D3D12::InitializeDownlevel() - current output window does not match hooked window! Currently hooked to {} while current output window is {}.", reinterpret_cast<void*>(hWnd), reinterpret_cast<void*>(ahWindow));
-
-    if (FAILED(apSourceTex2D->GetDevice(IID_PPV_ARGS(&m_pd3d12Device))))
-    {
-        Log::Error("D3D12::InitializeDownlevel() - failed to get device!");
-        return ResetState();
-    }
-
-    const size_t buffersCounts = m_downlevelBackbuffers.size();
-    m_frameContexts.resize(buffersCounts);
-    if (buffersCounts == 0)
-    {
-        Log::Error("D3D12::InitializeDownlevel() - no backbuffers were found!");
-        return ResetState();
-    }
-    if (buffersCounts < g_numDownlevelBackbuffersRequired)
-    {
-        Log::Info("D3D12::InitializeDownlevel() - backbuffer list is not complete yet; assuming window was resized");
-        return false;
-    }
-
-    D3D12_DESCRIPTOR_HEAP_DESC rtvdesc;
-    rtvdesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtvdesc.NumDescriptors = static_cast<UINT>(buffersCounts);
-    rtvdesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    rtvdesc.NodeMask = 1;
-    if (FAILED(m_pd3d12Device->CreateDescriptorHeap(&rtvdesc, IID_PPV_ARGS(&m_pd3dRtvDescHeap))))
-    {
-        Log::Error("D3D12::InitializeDownlevel() - failed to create RTV descriptor heap!");
-        return ResetState();
-    }
-
-    const SIZE_T rtvDescriptorSize = m_pd3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_pd3dRtvDescHeap->GetCPUDescriptorHandleForHeapStart();
-    for (auto& context : m_frameContexts)
-    {
-        context.MainRenderTargetDescriptor = rtvHandle;
-        rtvHandle.ptr += rtvDescriptorSize;
-    }
-
-    D3D12_DESCRIPTOR_HEAP_DESC srvdesc = {};
-    srvdesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvdesc.NumDescriptors = 2;
-    srvdesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(m_pd3d12Device->CreateDescriptorHeap(&srvdesc, IID_PPV_ARGS(&m_pd3dSrvDescHeap))))
-    {
-        Log::Error("D3D12::InitializeDownlevel() - failed to create SRV descriptor heap!");
-        return ResetState();
-    }
-
-    for (auto& context : m_frameContexts)
-    {
-        if (FAILED(m_pd3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&context.CommandAllocator))))
-        {
-            Log::Error("D3D12::InitializeDownlevel() - failed to create command allocator!");
-            return ResetState();
-        }
-    }
-
-    if (FAILED(m_pd3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_frameContexts[0].CommandAllocator.Get(), nullptr, IID_PPV_ARGS(&m_pd3dCommandList))))
-    {
-        Log::Error("D3D12::InitializeDownlevel() - failed to create command list!");
-        return ResetState();
-    }
-
-    if (FAILED(m_pd3dCommandList->Close()))
-    {
-        Log::Error("D3D12::InitializeDownlevel() - failed to close command list!");
-        return ResetState();
-    }
-
-    for (size_t i = 0; i < buffersCounts; i++)
-    {
-        auto& context = m_frameContexts[i];
-        context.BackBuffer = m_downlevelBackbuffers[i];
-        m_pd3d12Device->CreateRenderTargetView(context.BackBuffer.Get(), nullptr, context.MainRenderTargetDescriptor);
-    }
-
-    if (!InitializeImGui(buffersCounts))
-    {
-        Log::Error("D3D12::InitializeDownlevel() - failed to initialize ImGui!");
-        return ResetState();
-    }
-
-    Log::Info("D3D12::InitializeDownlevel() - initialization successful!");
-    m_initialized = true;
-
-    OnInitialized.Emit();
-
-    return true;
-}
-
-void D3D12::ReloadFonts()
-{
-    std::lock_guard _(m_imguiLock);
-
-    // TODO - scale also by DPI
-    const auto [resx, resy] = m_outSize;
-    const auto scaleFromReference = std::min(static_cast<float>(resx) / 1920.0f, static_cast<float>(resy) / 1080.0f);
+    ImGui_ImplDX12_InvalidateDeviceObjects();
 
     auto& io = ImGui::GetIO();
     io.Fonts->Clear();
 
     ImFontConfig config;
-    const auto& fontSettings = m_options.Font;
-    config.SizePixels = std::floorf(fontSettings.BaseSize * scaleFromReference);
-    config.OversampleH = fontSettings.OversampleHorizontal;
-    config.OversampleV = fontSettings.OversampleVertical;
+    config.SizePixels = cFontSize;
+    config.OversampleH = cFontSettings.OversampleHorizontal;
+    config.OversampleV = cFontSettings.OversampleVertical;
     if (config.OversampleH == 1 && config.OversampleV == 1)
         config.PixelSnapH = true;
     config.MergeMode = false;
 
     // add default font
-    const auto customFontPath = fontSettings.Path.empty() ? std::filesystem::path{} : GetAbsolutePath(UTF8ToUTF16(fontSettings.Path), m_paths.Fonts(), false);
+    const auto cCustomFontPath = cFontSettings.Path.empty() ? std::filesystem::path{} : GetAbsolutePath(UTF8ToUTF16(cFontSettings.Path), m_paths.Fonts(), false);
     auto cetFontPath = GetAbsolutePath(L"NotoSans-Regular.ttf", m_paths.Fonts(), false);
     const auto* cpGlyphRanges = io.Fonts->GetGlyphRangesDefault();
-    if (customFontPath.empty())
+    if (cCustomFontPath.empty())
     {
-        if (!fontSettings.Path.empty())
+        if (!cFontSettings.Path.empty())
             Log::Warn("D3D12::ReloadFonts() - Custom font path is invalid! Using default CET font.");
 
         if (cetFontPath.empty())
@@ -306,39 +180,39 @@ void D3D12::ReloadFonts()
             io.Fonts->AddFontFromFileTTF(UTF16ToUTF8(cetFontPath.native()).c_str(), config.SizePixels, &config, cpGlyphRanges);
     }
     else
-        io.Fonts->AddFontFromFileTTF(UTF16ToUTF8(customFontPath.native()).c_str(), config.SizePixels, &config, cpGlyphRanges);
+        io.Fonts->AddFontFromFileTTF(UTF16ToUTF8(cCustomFontPath.native()).c_str(), config.SizePixels, &config, cpGlyphRanges);
 
-    if (fontSettings.Language == "ChineseFull")
+    if (cFontSettings.Language == "ChineseFull")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSansTC-Regular.otf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesChineseFull();
     }
-    else if (fontSettings.Language == "ChineseSimplifiedCommon")
+    else if (cFontSettings.Language == "ChineseSimplifiedCommon")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSansSC-Regular.otf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
     }
-    else if (fontSettings.Language == "Japanese")
+    else if (cFontSettings.Language == "Japanese")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSansJP-Regular.otf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesJapanese();
     }
-    else if (fontSettings.Language == "Korean")
+    else if (cFontSettings.Language == "Korean")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSansKR-Regular.otf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesKorean();
     }
-    else if (fontSettings.Language == "Cyrillic")
+    else if (cFontSettings.Language == "Cyrillic")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSans-Regular.ttf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesCyrillic();
     }
-    else if (fontSettings.Language == "Thai")
+    else if (cFontSettings.Language == "Thai")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSansThai-Regular.ttf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesThai();
     }
-    else if (fontSettings.Language == "Vietnamese")
+    else if (cFontSettings.Language == "Vietnamese")
     {
         cetFontPath = GetAbsolutePath(m_paths.Fonts() / L"NotoSans-Regular.ttf", m_paths.Fonts(), false);
         cpGlyphRanges = io.Fonts->GetGlyphRangesVietnamese();
@@ -387,9 +261,9 @@ void D3D12::ReloadFonts()
 
     // add extra glyphs from language font
     config.MergeMode = true;
-    if (customFontPath.empty())
+    if (cCustomFontPath.empty())
     {
-        if (!fontSettings.Path.empty())
+        if (!cFontSettings.Path.empty())
             Log::Warn("D3D12::ReloadFonts() - Custom font path is invalid! Using default CET font.");
 
         if (cetFontPath.empty())
@@ -401,77 +275,99 @@ void D3D12::ReloadFonts()
             io.Fonts->AddFontFromFileTTF(UTF16ToUTF8(cetFontPath.native()).c_str(), config.SizePixels, &config, cpGlyphRanges);
     }
     else
-        io.Fonts->AddFontFromFileTTF(UTF16ToUTF8(customFontPath.native()).c_str(), config.SizePixels, &config, cpGlyphRanges);
+        io.Fonts->AddFontFromFileTTF(UTF16ToUTF8(cCustomFontPath.native()).c_str(), config.SizePixels, &config, cpGlyphRanges);
+
+    m_fontSettings = cFontSettings;
+
+    if (!ImGui_ImplDX12_CreateDeviceObjects())
+        Log::Error("D3D12::InitializeImGui() - ImGui_ImplDX12_CreateDeviceObjects call failed!");
 }
 
-bool D3D12::InitializeImGui(size_t aBuffersCounts)
+bool D3D12::InitializeImGui()
 {
-    std::lock_guard _(m_imguiLock);
+    assert(!m_initialized);
 
-    // TODO - scale also by DPI
-    const auto [resx, resy] = m_outSize;
-    const auto scaleFromReference = std::min(static_cast<float>(resx) / 1920.0f, static_cast<float>(resy) / 1080.0f);
-
-    if (ImGui::GetCurrentContext() == nullptr)
-    {
-        // do this once, do not repeat context creation!
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-
-        // TODO - make this configurable eventually and overridable by mods for themselves easily
-        // setup CET default style
-        ImGui::StyleColorsDark(&m_styleReference);
-        m_styleReference.WindowRounding = 6.0f;
-        m_styleReference.WindowTitleAlign.x = 0.5f;
-        m_styleReference.ChildRounding = 6.0f;
-        m_styleReference.PopupRounding = 6.0f;
-        m_styleReference.FrameRounding = 6.0f;
-        m_styleReference.ScrollbarRounding = 12.0f;
-        m_styleReference.GrabRounding = 12.0f;
-        m_styleReference.TabRounding = 6.0f;
-    }
-
-    ImGui::GetStyle() = m_styleReference;
-    ImGui::GetStyle().ScaleAllSizes(scaleFromReference);
-
-    if (!ImGui_ImplWin32_Init(m_window.GetWindow()))
-    {
-        Log::Error("D3D12::InitializeImGui() - ImGui_ImplWin32_Init call failed!");
+    // we need valid swap chain data ID (this must be set even on Win7)
+    if (m_swapChainDataId == 0)
         return false;
-    }
 
-    if (!ImGui_ImplDX12_Init(m_pd3d12Device.Get(), static_cast<int>(aBuffersCounts),
-        DXGI_FORMAT_R8G8B8A8_UNORM, m_pd3dSrvDescHeap.Get(),
-        m_pd3dSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
-        m_pd3dSrvDescHeap->GetGPUDescriptorHandleForHeapStart()))
-    {
-        Log::Error("D3D12::InitializeImGui() - ImGui_ImplDX12_Init call failed!");
-        ImGui_ImplWin32_Shutdown();
+    // we need valid render context
+    const auto* cpRenderContext = RenderContext::GetInstance();
+    if (cpRenderContext == nullptr)
         return false;
-    }
 
-    ReloadFonts();
-
-    if (!ImGui_ImplDX12_CreateDeviceObjects(m_pCommandQueue.Get()))
-    {
-        Log::Error("D3D12::InitializeImGui() - ImGui_ImplDX12_CreateDeviceObjects call failed!");
-        ImGui_ImplDX12_Shutdown();
-        ImGui_ImplWin32_Shutdown();
+    // we need to have valid device
+    const auto cpDevice = cpRenderContext->pDevice;
+    if (cpDevice == nullptr)
         return false;
-    }
+
+    // we need to have valid command queue
+    const auto cpCommandQueue = cpRenderContext->pDirectCommandQueue;
+    if (cpCommandQueue == nullptr)
+        return false;
+
+    // do this once, do not repeat context creation!
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+
+    auto& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;       // Enable Keyboard Controls
+    //io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;           // Enable Docking
+    //io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;         // Enable Multi-Viewport / Platform Windows
+    //io.ConfigViewportsNoAutoMerge = true;
+    //io.ConfigViewportsNoTaskBarIcon = true;
+
+    // TODO - make this configurable eventually and overridable by mods for themselves easily
+    // setup CET default style
+    ImGui::StyleColorsDark(&m_imguiStyleReference);
+    m_imguiStyleReference.WindowRounding = 6.0f;
+    m_imguiStyleReference.WindowTitleAlign.x = 0.5f;
+    m_imguiStyleReference.ChildRounding = 6.0f;
+    m_imguiStyleReference.PopupRounding = 6.0f;
+    m_imguiStyleReference.FrameRounding = 6.0f;
+    m_imguiStyleReference.ScrollbarRounding = 12.0f;
+    m_imguiStyleReference.GrabRounding = 12.0f;
+    m_imguiStyleReference.TabRounding = 6.0f;
+
+    io.DisplaySize = GetResolution();
+
+	  if (!ImGui_ImplWin32_Init(m_window.GetWindow()))
+	  {
+	      Log::Error("D3D12::InitializeImGui() - ImGui_ImplWin32_Init call failed!");
+	      return false;
+	  }
+
+	  if (!ImGui_ImplDX12_Init(cpDevice.Get(), cpCommandQueue->GetDesc().NodeMask,
+          static_cast<uint32_t>(SwapChainData_BackBufferCount),
+	      DXGI_FORMAT_R8G8B8A8_UNORM, m_pd3dSrvDescHeap.Get(),
+	      m_pd3dSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+	      m_pd3dSrvDescHeap->GetGPUDescriptorHandleForHeapStart()))
+	  {
+	      Log::Error("D3D12::InitializeImGui() - ImGui_ImplDX12_Init call failed!");
+	      ImGui_ImplWin32_Shutdown();
+	      return false;
+	  }
+
+    ReloadFonts(true);
 
     return true;
 }
 
 void D3D12::PrepareUpdate()
 {
-    if (!m_initialized)
+    std::lock_guard stateGameLock(m_stateGameMutex);
+
+    if (!m_initialized || m_shutdown)
         return;
 
-    std::lock_guard _(m_imguiLock);
-
-    ImGui_ImplWin32_NewFrame(m_outSize);
+    ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.0f, 0.0f, 0.0f, 0.0f});
+    ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, {0.0f, 0.0f, 0.0f, 0.0f});
+    ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
+    ImGui::PopStyleColor(2);
 
     CET::Get().GetOverlay().Update();
 
@@ -494,15 +390,53 @@ void D3D12::PrepareUpdate()
         copiedDrawLists[i] = drawData.CmdLists[i]->CloneOutput();
     drawData.CmdLists = copiedDrawLists;
 
+    std::lock_guard imguiLock(m_imguiMutex);
+
     std::swap(m_imguiDrawDataBuffers[1], m_imguiDrawDataBuffers[2]);
 }
 
-void D3D12::Update()
+void D3D12::Update(uint32_t aSwapChainDataId)
 {
+    std::lock_guard statePresentLock(m_statePresentMutex);
+
+    if (!m_initialized || m_shutdown)
+        return;
+
+    if (m_swapChainDataId != aSwapChainDataId)
+        return;
+
+    // we need valid swap chain data ID (this must be set even on Win7)
+    if (aSwapChainDataId == 0)
+        return;
+
+    // we need valid render context
+    const auto* cpRenderContext = RenderContext::GetInstance();
+    if (cpRenderContext == nullptr)
+        return;
+
+    // if any back buffer is nullptr, don't continue update
+    auto swapChainData = cpRenderContext->pSwapChainData[aSwapChainDataId - 1];
+    for (auto& pBackBuffer : swapChainData.backBuffers)
+    {
+        if (pBackBuffer == nullptr)
+            return;
+    }
+
+    // we need to have valid command queue
+    const auto cpCommandQueue = cpRenderContext->pDirectCommandQueue;
+    if (cpCommandQueue == nullptr)
+        return;
+
+    const auto cBackBufferIndex = swapChainData.backBufferIndex;
+    const auto cpBackBuffer = swapChainData.backBuffers[cBackBufferIndex];
+    const auto cpRenderTargetView = swapChainData.renderTargetViews[cBackBufferIndex];
+
+    const auto& cFrameContext = m_frameContexts[cBackBufferIndex];
+
     // swap staging ImGui buffer with render ImGui buffer
     {
-        std::lock_guard _(m_imguiLock);
-        ImGui_ImplDX12_NewFrame(m_pCommandQueue.Get());
+        std::lock_guard imguiLock(m_imguiMutex);
+
         if (m_imguiDrawDataBuffers[1].Valid)
         {
             std::swap(m_imguiDrawDataBuffers[0], m_imguiDrawDataBuffers[1]);
@@ -513,33 +447,36 @@ void D3D12::Update()
     if (!m_imguiDrawDataBuffers[0].Valid)
         return;
 
-    const auto bufferIndex = m_pdxgiSwapChain != nullptr ? m_pdxgiSwapChain->GetCurrentBackBufferIndex() : m_downlevelBufferIndex;
-    auto& frameContext = m_frameContexts[bufferIndex];
-    frameContext.CommandAllocator->Reset();
+    const auto cResolution = GetResolution();
+    const auto cDrawDataResolution = m_imguiDrawDataBuffers[0].DisplaySize;
+    if (cDrawDataResolution.x != cResolution.x || cDrawDataResolution.y != cResolution.y)
+        return;
+
+    cFrameContext.CommandAllocator->Reset();
 
     D3D12_RESOURCE_BARRIER barrier;
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    barrier.Transition.pResource = frameContext.BackBuffer.Get();
+    barrier.Transition.pResource = cpBackBuffer.Get();
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     ID3D12DescriptorHeap* heaps[] = { m_pd3dSrvDescHeap.Get() };
 
-    m_pd3dCommandList->Reset(frameContext.CommandAllocator.Get(), nullptr);
-    m_pd3dCommandList->ResourceBarrier(1, &barrier);
-    m_pd3dCommandList->SetDescriptorHeaps(1, heaps);
-    m_pd3dCommandList->OMSetRenderTargets(1, &frameContext.MainRenderTargetDescriptor, FALSE, nullptr);
+    cFrameContext.CommandList->Reset(cFrameContext.CommandAllocator.Get(), nullptr);
+    cFrameContext.CommandList->ResourceBarrier(1, &barrier);
+    cFrameContext.CommandList->SetDescriptorHeaps(1, heaps);
+    cFrameContext.CommandList->OMSetRenderTargets(1, &cpRenderTargetView, FALSE, nullptr);
 
-    ImGui_ImplDX12_RenderDrawData(&m_imguiDrawDataBuffers[0], m_pd3dCommandList.Get());
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplDX12_RenderDrawData(&m_imguiDrawDataBuffers[0], cFrameContext.CommandList.Get());
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    m_pd3dCommandList->ResourceBarrier(1, &barrier);
-    m_pd3dCommandList->Close();
+    cFrameContext.CommandList->ResourceBarrier(1, &barrier);
+    cFrameContext.CommandList->Close();
 
-    ID3D12CommandList* commandLists[] = { m_pd3dCommandList.Get() };
-    m_pCommandQueue->ExecuteCommandLists(1, commandLists);
+    ID3D12CommandList* commandLists[] = { cFrameContext.CommandList.Get() };
+    cpCommandQueue->ExecuteCommandLists(1, commandLists);
 }
-

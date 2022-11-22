@@ -12,7 +12,7 @@ using TClipToCenter = HWND(RED4ext::CGameEngine::UnkC0*);
 struct Overlay
 {
     Overlay(VKBindings& aBindings, Options& aOptions, PersistentState& aPersistentState, LuaVM& aVm);
-    ~Overlay();
+    ~Overlay() = default;
 
     void PostInitialize();
 
@@ -46,7 +46,7 @@ private:
 
     std::atomic_bool m_enabled{ false };
     std::atomic_bool m_toggled{ false };
-    bool m_initialized{ false };
+    std::atomic_bool m_initialized{ false };
 
     Options& m_options;
     PersistentState& m_persistentState;

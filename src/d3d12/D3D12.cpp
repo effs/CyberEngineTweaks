@@ -1,11 +1,13 @@
 #include <stdafx.h>
 
 #include "D3D12.h"
-#include "CET.h"
 
-#include <imgui_impl/dx12.h>
-#include <imgui_impl/win32.h>
+#include <CET.h>
+#include <imgui/imgui_impl_dx12.h>
+#include <imgui/imgui_impl_win32.h>
 #include <scripting/GameHooks.h>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 void D3D12::SetTrapInputInImGui(const bool acEnabled)
 {
@@ -28,8 +30,9 @@ LRESULT D3D12::OnWndProc(HWND ahWnd, UINT auMsg, WPARAM awParam, LPARAM alParam)
 {
     auto& d3d12 = CET::Get().GetD3D12();
 
-    if (d3d12.IsInitialized())
     {
+        std::lock_guard stateGameLock(d3d12.m_stateGameMutex);
+
         if (const auto res = ImGui_ImplWin32_WndProcHandler(ahWnd, auMsg, awParam, alParam))
             return res;
 
@@ -38,18 +41,18 @@ LRESULT D3D12::OnWndProc(HWND ahWnd, UINT auMsg, WPARAM awParam, LPARAM alParam)
             d3d12.SetTrapInputInImGui(m_delayedTrapInputState);
             d3d12.m_delayedTrapInput = false;
         }
+    }
 
-        if (d3d12.m_trapInputInImGui) // TODO: look into io.WantCaptureMouse and io.WantCaptureKeyboard
-        {
-            // ignore mouse & keyboard events
-            if ((auMsg >= WM_MOUSEFIRST && auMsg <= WM_MOUSELAST) ||
-                (auMsg >= WM_KEYFIRST && auMsg <= WM_KEYLAST))
-                return 1;
+    if (d3d12.m_trapInputInImGui) // TODO: look into io.WantCaptureMouse and io.WantCaptureKeyboard
+    {
+        // ignore mouse & keyboard events
+        if ((auMsg >= WM_MOUSEFIRST && auMsg <= WM_MOUSELAST) ||
+            (auMsg >= WM_KEYFIRST && auMsg <= WM_KEYLAST))
+            return 1;
 
-            // ignore input messages
-            if (auMsg == WM_INPUT)
-                return 1;
-        }
+        // ignore input messages
+        if (auMsg == WM_INPUT)
+            return 1;
     }
 
     return 0;
@@ -60,13 +63,22 @@ D3D12::D3D12(Window& aWindow, Paths& aPaths, Options& aOptions)
     , m_window(aWindow)
     , m_options(aOptions)
 {
-    HookGame();
+    m_fontSettings = m_options.Font;
 
-    // add repeated task which prepares next ImGui frame for update
-    GameMainThread::Get().AddGenericTask([this]{ PrepareUpdate(); return false; });
+    Hook();
+
+    // add repeated task called in all stages excluding shutdown which prepares ImGui frame for next present
+    GameMainThread::Get().AddBaseInitializationTask([this]{ PrepareUpdate(); return false; });
+    GameMainThread::Get().AddInitializationTask([this]{ PrepareUpdate(); return false; });
+    GameMainThread::Get().AddRunningTask([this]{ PrepareUpdate(); return false; });
+
+    // add shutdown task which frees acquired resources
+    GameMainThread::Get().AddShutdownTask([this]{ Shutdown(); return true; });
 }
 
 D3D12::~D3D12()
 {
-    assert(!m_initialized);
+    assert(!m_initialized && m_shutdown);
+    if (m_initialized)
+        Shutdown();
 }
